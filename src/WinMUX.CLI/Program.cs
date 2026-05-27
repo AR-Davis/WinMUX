@@ -1,238 +1,601 @@
-using System.ComponentModel;
+using System.Diagnostics;
 using System.IO.Pipes;
 using System.Runtime.InteropServices;
+using System.Text.Json;
+using System.Text.Json.Nodes;
+using System.ComponentModel;
 using WinMUX.Core;
 
 if (args.Length == 0)
 {
-    Console.WriteLine("Usage: WinMUX.CLI <session-name>");
+    ShowUsage();
     return;
 }
 
-string pipeName = $"WinMUX-{args[0]}";
-Console.Error.WriteLine($"[DIAG] Connecting to pipe {pipeName}...");
+var command = args[0].ToLowerInvariant();
 
-using var client = new NamedPipeClientStream(
-    ".", pipeName, PipeDirection.InOut, PipeOptions.Asynchronous);
-
-Console.Error.WriteLine("[DIAG] About to ConnectAsync...");
-await client.ConnectAsync();
-Console.Error.WriteLine("[DIAG] Connected to pipe.");
-
-// ---------- Detect whether we own a real Windows console ----------
-var hIn  = NativeMethods.GetStdHandle(NativeMethods.STD_INPUT_HANDLE);
-var hOut = NativeMethods.GetStdHandle(NativeMethods.STD_OUTPUT_HANDLE);
-
-Console.Error.WriteLine($"[DIAG] hIn=0x{hIn:X}, hOut=0x{hOut:X}");
-
-bool inIsConsole  = NativeMethods.GetConsoleMode(hIn,  out uint origInMode);
-bool outIsConsole = NativeMethods.GetConsoleMode(hOut, out uint origOutMode);
-bool isRealConsole = inIsConsole && outIsConsole;
-
-Console.Error.WriteLine($"[DIAG] inIsConsole={inIsConsole}, outIsConsole={outIsConsole}, isRealConsole={isRealConsole}");
-
-Action? restoreConsole = null;
-
-if (isRealConsole)
+switch (command)
 {
-    uint rawInMode = (origInMode
-                      & ~(NativeMethods.ENABLE_LINE_INPUT
-                           | NativeMethods.ENABLE_ECHO_INPUT))
-                      | NativeMethods.ENABLE_VIRTUAL_TERMINAL_INPUT;
+    case "ls":
+    case "list":
+        await ListSessions();
+        break;
+    case "new":
+        if (args.Length < 2)
+        {
+            Console.WriteLine("Usage: winmux new <name> [shell]");
+            return;
+        }
+        await CreateSession(args[1], args.Length >= 3 ? args[2] : GetDefaultShell());
+        break;
+    case "attach":
+        if (args.Length < 2)
+        {
+            Console.WriteLine("Usage: winmux attach <name>");
+            return;
+        }
+        await AttachToSession(args[1]);
+        break;
+    case "kill":
+    case "stop":
+        if (args.Length < 2)
+        {
+            Console.WriteLine("Usage: winmux kill <name>");
+            return;
+        }
+        await KillSession(args[1]);
+        break;
+    case "daemon":
+        await HandleDaemon(args.Skip(1).ToArray());
+        break;
+    case "help":
+    case "--help":
+    case "-h":
+        ShowUsage();
+        break;
+    default:
+        Console.WriteLine($"Unknown command: {command}");
+        ShowUsage();
+        break;
+}
 
-    Console.Error.WriteLine($"[DIAG] Setting console input mode to 0x{rawInMode:X}...");
-    if (!NativeMethods.SetConsoleMode(hIn, rawInMode))
-        throw new Win32Exception(Marshal.GetLastWin32Error());
-    Console.Error.WriteLine("[DIAG] Input mode set OK.");
+static void ShowUsage()
+{
+    Console.WriteLine("WinMUX v0.2 - Windows Terminal Multiplexer\n");
+    Console.WriteLine("USAGE:");
+    Console.WriteLine("    winmux <command> [args...]\n");
+    Console.WriteLine("COMMANDS:");
+    Console.WriteLine("    ls, list              List active sessions");
+    Console.WriteLine("    new <name> [shell]    Create a new session");
+    Console.WriteLine("    attach <name>         Attach to a session");
+    Console.WriteLine("    kill <name>           Kill a session");
+    Console.WriteLine("    daemon [start|stop|status]  Manage the daemon\n");
+    Console.WriteLine("EXAMPLES:");
+    Console.WriteLine("    winmux new main cmd.exe");
+    Console.WriteLine("    winmux new dev powershell.exe");
+    Console.WriteLine("    winmux attach main");
+    Console.WriteLine("    winmux ls");
+    Console.WriteLine("    winmux kill dev\n");
+    Console.WriteLine("DAEMON CONTROL:");
+    Console.WriteLine("    winmux daemon         Show daemon status");
+    Console.WriteLine("    winmux daemon start   Start background daemon");
+    Console.WriteLine("    winmux daemon stop    Stop running daemon");
+}
 
-    uint vtOutMode = origOutMode | NativeMethods.ENABLE_VIRTUAL_TERMINAL_PROCESSING;
-    Console.Error.WriteLine($"[DIAG] Setting console output mode to 0x{vtOutMode:X}...");
-    if (!NativeMethods.SetConsoleMode(hOut, vtOutMode))
-        throw new Win32Exception(Marshal.GetLastWin32Error());
-    Console.Error.WriteLine("[DIAG] Output mode set OK.");
+static string GetDefaultShell()
+{
+    var psPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.System), "WindowsPowerShell", "v1.0", "powershell.exe");
+    if (!File.Exists(psPath))
+        psPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.System), "WindowsPowerShell", "v1.0", "pwsh.exe");
+    
+    return File.Exists(psPath) ? psPath : "cmd.exe";
+}
 
-    restoreConsole = () =>
+static async Task EnsureDaemonRunning()
+{
+    if (await IsDaemonRunning())
+        return;
+
+    Console.WriteLine("Starting WinMUX daemon...");
+    StartDaemon();
+
+    for (int i = 0; i < 20; i++)
     {
-        NativeMethods.SetConsoleMode(hIn,  origInMode);
-        NativeMethods.SetConsoleMode(hOut, origOutMode);
+        await Task.Delay(500);
+        if (await IsDaemonRunning())
+            return;
+    }
+
+    Console.Error.WriteLine("Failed to start daemon");
+    Environment.Exit(1);
+}
+
+static async Task<bool> IsDaemonRunning()
+{
+    try
+    {
+        using var client = new NamedPipeClientStream(".", "WinMUX-control", PipeDirection.InOut, PipeOptions.Asynchronous);
+        await client.ConnectAsync(500);
+        using var writer = new StreamWriter(client) { AutoFlush = true };
+        using var reader = new StreamReader(client);
+        await writer.WriteLineAsync("version");
+        var response = await reader.ReadLineAsync();
+        return response?.Length > 0 == true;
+    }
+    catch
+    {
+        return false;
+    }
+}
+
+static void StartDaemon()
+{
+    var daemonPath = FindDaemonExecutable();
+    if (daemonPath == null)
+    {
+        Console.Error.WriteLine("WinMUX.Daemon.exe not found");
+        Environment.Exit(1);
+    }
+
+    var startInfo = new ProcessStartInfo
+    {
+        FileName = daemonPath,
+        UseShellExecute = false,
+        CreateNoWindow = true,
+        WorkingDirectory = Path.GetDirectoryName(daemonPath)
     };
 
-    Console.Error.WriteLine("[DIAG] RAW MODE ACTIVE. Press Ctrl+B then D to detach.");
-    Console.WriteLine("Connected. Raw VT mode enabled.");
-    Console.WriteLine("Prefix key is Ctrl+B.  Ctrl+B then D = detach.  Ctrl+B then Ctrl+B = send literal Ctrl+B.");
-}
-else
-{
-    Console.WriteLine("[warn] No Windows console detected.");
-    Console.WriteLine("[warn] Falling back to line-buffered input.");
-    Console.WriteLine("Connected. Press Ctrl+D (EOF) to detach.");
+    Process.Start(startInfo);
 }
 
-Console.CancelKeyPress += (s, e) =>
+static async Task StopDaemon()
 {
-    Console.Error.WriteLine("[DIAG] CancelKeyPress fired!");
-    e.Cancel = true;
-    try { client.Dispose(); } catch { }
-};
+    var stateDir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "WinMUX");
+    var lockFile = Path.Combine(stateDir, "daemon.lock");
 
-try
+    if (!File.Exists(lockFile))
+    {
+        Console.WriteLine("Daemon not running (no lock file)");
+        return;
+    }
+
+    var pidStr = await File.ReadAllTextAsync(lockFile);
+    if (!int.TryParse(pidStr, out var pid))
+    {
+        Console.Error.WriteLine("Corrupt lock file");
+        return;
+    }
+
+    try
+    {
+        var proc = Process.GetProcessById(pid);
+        proc.Kill();
+        Console.WriteLine("Daemon stopped");
+    }
+    catch (ArgumentException)
+    {
+        Console.WriteLine("Daemon not running (stale lock file, cleaning up)");
+        File.Delete(lockFile);
+    }
+}
+
+static async Task HandleDaemon(string[] args)
 {
-    var stdOut = Console.OpenStandardOutput();
-    Console.Error.WriteLine("[DIAG] stdout handle opened.");
+    var subcommand = args.Length > 0 ? args[0].ToLowerInvariant() : "status";
 
-    Thread? inThread = null;
+    switch (subcommand)
+    {
+        case "start":
+            if (await IsDaemonRunning())
+            {
+                Console.WriteLine("Daemon already running");
+                return;
+            }
+            StartDaemon();
+            Console.WriteLine("Daemon started");
+            break;
+        case "stop":
+            await StopDaemon();
+            break;
+        case "status":
+        default:
+            var running = await IsDaemonRunning();
+            Console.WriteLine(running ? "Daemon is running" : "Daemon is not running");
+            
+            var stateDir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "WinMUX");
+            var sessionsFile = Path.Combine(stateDir, "sessions.json");
+            if (File.Exists(sessionsFile))
+            {
+                var content = await File.ReadAllTextAsync(sessionsFile);
+                try
+                {
+                    var doc = JsonNode.Parse(content);
+                    if (doc?["Sessions"] is JsonArray arr)
+                    {
+                        Console.WriteLine($"Sessions in state file: {arr.Count}");
+                    }
+                }
+                catch { }
+            }
+            break;
+    }
+}
+
+static async Task ListSessions()
+{
+    await EnsureDaemonRunning();
+
+    try
+    {
+        using var client = new NamedPipeClientStream(".", "WinMUX-control", PipeDirection.InOut, PipeOptions.Asynchronous);
+        await client.ConnectAsync(5000);
+        using var writer = new StreamWriter(client) { AutoFlush = true };
+        using var reader = new StreamReader(client);
+
+        await writer.WriteLineAsync("ls");
+        var response = await reader.ReadLineAsync();
+
+        if (response == "[]")
+        {
+            Console.WriteLine("No active sessions");
+            return;
+        }
+
+        var sessions = JsonSerializer.Deserialize<List<SessionInfo>>(response ?? "[]");
+        if (sessions == null || sessions.Count == 0)
+        {
+            Console.WriteLine("No active sessions");
+            return;
+        }
+
+        Console.WriteLine($"{"Name",-12} {"PID",-8} {"Shell",-20} {"Created",-20} Status");
+        Console.WriteLine(new string('-', 70));
+
+        foreach (var s in sessions)
+        {
+            bool running = IsProcessRunning(s.ProcessId);
+            var status = running ? "running" : "dead";
+            var shell = Path.GetFileName(s.Shell);
+            var created = s.CreatedAt.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss");
+            Console.WriteLine($"{s.Name,-12} {s.ProcessId,-8} {shell,-20} {created,-20} {status}");
+        }
+    }
+    catch (Exception ex)
+    {
+        Console.Error.WriteLine($"Error listing sessions: {ex.Message}");
+    }
+}
+
+static async Task CreateSession(string name, string shell)
+{
+    await EnsureDaemonRunning();
+
+    if (!System.Text.RegularExpressions.Regex.IsMatch(name, @"^[a-zA-Z0-9_-]+$"))
+    {
+        Console.Error.WriteLine("Session name must be alphanumeric with - or _ only");
+        return;
+    }
+
+    try
+    {
+        using var client = new NamedPipeClientStream(".", "WinMUX-control", PipeDirection.InOut, PipeOptions.Asynchronous);
+        await client.ConnectAsync(5000);
+        using var writer = new StreamWriter(client) { AutoFlush = true };
+        using var reader = new StreamReader(client);
+
+        await writer.WriteLineAsync($"new {name} {shell}");
+        var response = await reader.ReadLineAsync();
+
+        if (response?.StartsWith("ok:") == true)
+        {
+            var pid = response[4..].Trim();
+            Console.WriteLine($"Session '{name}' started (PID {pid})");
+            Console.WriteLine($"Attach with: winmux attach {name}");
+        }
+        else if (response?.StartsWith("error:") == true)
+        {
+            Console.Error.WriteLine($"Failed to create session: {response[7..]}");
+        }
+        else
+        {
+            Console.Error.WriteLine($"Unexpected response: {response}");
+        }
+    }
+    catch (Exception ex)
+    {
+        Console.Error.WriteLine($"Error creating session: {ex.Message}");
+    }
+}
+
+static async Task KillSession(string name)
+{
+    await EnsureDaemonRunning();
+
+    try
+    {
+        using var client = new NamedPipeClientStream(".", "WinMUX-control", PipeDirection.InOut, PipeOptions.Asynchronous);
+        await client.ConnectAsync(5000);
+        using var writer = new StreamWriter(client) { AutoFlush = true };
+        using var reader = new StreamReader(client);
+
+        await writer.WriteLineAsync($"kill {name}");
+        var response = await reader.ReadLineAsync();
+
+        if (response == "ok")
+        {
+            Console.WriteLine($"Session '{name}' killed");
+        }
+        else if (response?.StartsWith("error:") == true)
+        {
+            Console.Error.WriteLine($"Failed to kill session: {response[7..]}");
+        }
+    }
+    catch (Exception ex)
+    {
+        Console.Error.WriteLine($"Error killing session: {ex.Message}");
+    }
+}
+
+static async Task AttachToSession(string name)
+{
+    await EnsureDaemonRunning();
+
+    string pipeName;
+    try
+    {
+        using var client = new NamedPipeClientStream(".", "WinMUX-control", PipeDirection.InOut, PipeOptions.Asynchronous);
+        await client.ConnectAsync(5000);
+        using var writer = new StreamWriter(client) { AutoFlush = true };
+        using var reader = new StreamReader(client);
+
+        await writer.WriteLineAsync($"attach-info {name}");
+        var response = await reader.ReadLineAsync();
+
+        if (response?.StartsWith("ok:") == true)
+        {
+            pipeName = response[4..].Trim();
+        }
+        else if (response?.StartsWith("error:") == true)
+        {
+            Console.Error.WriteLine($"Cannot attach: {response[7..]}");
+            return;
+        }
+        else
+        {
+            Console.Error.WriteLine($"Unexpected response: {response}");
+            return;
+        }
+    }
+    catch (Exception ex)
+    {
+        Console.Error.WriteLine($"Error querying session: {ex.Message}");
+        return;
+    }
+
+    Console.Error.WriteLine($"[DIAG] Connecting to {pipeName}...");
+    using var pipe = new NamedPipeClientStream(".", pipeName, PipeDirection.InOut, PipeOptions.Asynchronous);
+
+    try
+    {
+        await pipe.ConnectAsync(10000);
+    }
+    catch (Exception ex)
+    {
+        Console.Error.WriteLine($"Failed to connect to session: {ex.Message}");
+        Console.Error.WriteLine("Session may have exited. Run 'winmux ls' to verify.");
+        return;
+    }
+
+    Console.Error.WriteLine("[DIAG] Connected.");
+
+    var hIn = NativeMethods.GetStdHandle(NativeMethods.STD_INPUT_HANDLE);
+    var hOut = NativeMethods.GetStdHandle(NativeMethods.STD_OUTPUT_HANDLE);
+
+    bool inIsConsole = NativeMethods.GetConsoleMode(hIn, out uint origInMode);
+    bool outIsConsole = NativeMethods.GetConsoleMode(hOut, out uint origOutMode);
+    bool isRealConsole = inIsConsole && outIsConsole;
+
+    Action? restoreConsole = null;
 
     if (isRealConsole)
     {
-        Console.Error.WriteLine("[DIAG] Starting raw input thread...");
-        inThread = new Thread(() =>
+        uint rawInMode = (origInMode
+            & ~(NativeMethods.ENABLE_LINE_INPUT | NativeMethods.ENABLE_ECHO_INPUT))
+            | NativeMethods.ENABLE_VIRTUAL_TERMINAL_INPUT;
+
+        if (!NativeMethods.SetConsoleMode(hIn, rawInMode))
+            throw new Win32Exception(Marshal.GetLastWin32Error());
+
+        uint vtOutMode = origOutMode | NativeMethods.ENABLE_VIRTUAL_TERMINAL_PROCESSING;
+        if (!NativeMethods.SetConsoleMode(hOut, vtOutMode))
+            throw new Win32Exception(Marshal.GetLastWin32Error());
+
+        restoreConsole = () =>
         {
-            byte[] buf = new byte[1024];
-            bool prefixActive = false;
-            try
-            {
-                Console.Error.WriteLine("[DIAG] Input thread alive, about to ReadFile...");
-                while (true)
-                {
-                    uint nRead = 0;
-                    Console.Error.WriteLine("[DIAG] Calling ReadFile on hIn...");
-                    bool ok = NativeMethods.ReadFile(hIn, buf, (uint)buf.Length, out nRead, IntPtr.Zero);
-                    if (!ok)
-                    {
-                        int err = Marshal.GetLastWin32Error();
-                        Console.Error.WriteLine($"[DIAG] ReadFile failed, err={err}. Disposing client.");
-                        try { client.Dispose(); } catch { }
-                        break;
-                    }
-                    Console.Error.WriteLine($"[DIAG] ReadFile returned {nRead} bytes");
-
-                    if (nRead == 0)
-                    {
-                        Console.Error.WriteLine("[DIAG] ReadFile returned 0 (EOF). Disposing client.");
-                        try { client.Dispose(); } catch { }
-                        break;
-                    }
-
-                    int n = (int)nRead;
-                    int i = 0;
-                    while (i < n)
-                    {
-                        byte b = buf[i];
-
-                        if (prefixActive)
-                        {
-                            prefixActive = false;
-
-                            if (b == (byte)'d' || b == (byte)'D')
-                            {
-                                Console.Error.WriteLine("[DIAG] Detach command (Ctrl+B D). Disposing client.");
-                                try { client.Dispose(); } catch { }
-                                return;
-                            }
-
-                            if (b == 0x02)
-                            {
-                                client.Write(new byte[] { 0x02 }, 0, 1);
-                                client.Flush();
-                                i++;
-                                continue;
-                            }
-
-                            client.Write(new byte[] { 0x02 }, 0, 1);
-                            client.Write(buf, i, 1);
-                            client.Flush();
-                            i++;
-                        }
-                        else if (b == 0x02) // Ctrl+B
-                        {
-                            prefixActive = true;
-                            i++;
-                        }
-                        else
-                        {
-                            int start = i;
-                            while (i < n && buf[i] != 0x02) i++;
-                            client.Write(buf, start, i - start);
-                            client.Flush();
-                        }
-                    }
-                }
-            }
-            catch (Exception ex)
-            {
-                Console.Error.WriteLine($"[DIAG] Input thread exception: {ex.GetType().Name}: {ex.Message}");
-            }
-            Console.Error.WriteLine("[DIAG] Input thread exiting.");
-        })
-        {
-            IsBackground = true,
-            Name = "winmux-input"
+            NativeMethods.SetConsoleMode(hIn, origInMode);
+            NativeMethods.SetConsoleMode(hOut, origOutMode);
         };
+
+        Console.WriteLine("Connected. Raw VT mode enabled.");
+        Console.WriteLine("Prefix key is Ctrl+B.  Ctrl+B then D = detach.");
     }
     else
     {
-        inThread = new Thread(() =>
-        {
-            try
-            {
-                while (true)
-                {
-                    string? line = Console.ReadLine();
-                    if (line is null)
-                    {
-                        try { client.Dispose(); } catch { }
-                        break;
-                    }
-                    byte[] data = System.Text.Encoding.UTF8.GetBytes(line + "\r\n");
-                    client.Write(data, 0, data.Length);
-                    client.Flush();
-                }
-            }
-            catch { }
-        })
-        {
-            IsBackground = true,
-            Name = "winmux-input-fallback"
-        };
+        Console.WriteLine("[warn] No Windows console detected.");
+        Console.WriteLine("[warn] Falling back to line-buffered input.");
+        Console.WriteLine("Connected. Press Ctrl+D (EOF) to detach.");
     }
 
-    inThread.Start();
-    Console.Error.WriteLine("[DIAG] Input thread started. Entering output loop...");
+    Console.CancelKeyPress += (s, e) =>
+    {
+        e.Cancel = true;
+        try { pipe.Dispose(); } catch { }
+    };
 
-    byte[] outBuf = new byte[4096];
     try
     {
-        while (true)
+        var stdOut = Console.OpenStandardOutput();
+        Thread? inThread = null;
+
+        if (isRealConsole)
         {
-            Console.Error.WriteLine("[DIAG] Calling client.Read()...");
-            int read = client.Read(outBuf, 0, outBuf.Length);
-            Console.Error.WriteLine($"[DIAG] client.Read() returned {read}");
-            if (read == 0) break;
-            stdOut.Write(outBuf, 0, read);
-            stdOut.Flush();
+            inThread = new Thread(() =>
+            {
+                byte[] buf = new byte[1024];
+                bool prefixActive = false;
+                try
+                {
+                    while (true)
+                    {
+                        uint nRead = 0;
+                        bool ok = NativeMethods.ReadFile(hIn, buf, (uint)buf.Length, out nRead, IntPtr.Zero);
+                        if (!ok || nRead == 0)
+                        {
+                            try { pipe.Dispose(); } catch { }
+                            break;
+                        }
+
+                        int n = (int)nRead;
+                        int i = 0;
+                        while (i < n)
+                        {
+                            byte b = buf[i];
+
+                            if (prefixActive)
+                            {
+                                prefixActive = false;
+
+                                if (b == (byte)'d' || b == (byte)'D')
+                                {
+                                    try { pipe.Dispose(); } catch { }
+                                    return;
+                                }
+
+                                if (b == 0x02)
+                                {
+                                    pipe.Write(new byte[] { 0x02 }, 0, 1);
+                                    pipe.Flush();
+                                    i++;
+                                    continue;
+                                }
+
+                                pipe.Write(new byte[] { 0x02 }, 0, 1);
+                                pipe.Write(buf, i, 1);
+                                pipe.Flush();
+                                i++;
+                            }
+                            else if (b == 0x02)
+                            {
+                                prefixActive = true;
+                                i++;
+                            }
+                            else
+                            {
+                                int start = i;
+                                while (i < n && buf[i] != 0x02) i++;
+                                pipe.Write(buf, start, i - start);
+                                pipe.Flush();
+                            }
+                        }
+                    }
+                }
+                catch { }
+            })
+            { IsBackground = true, Name = "winmux-input" };
+        }
+        else
+        {
+            inThread = new Thread(() =>
+            {
+                try
+                {
+                    while (true)
+                    {
+                        string? line = Console.ReadLine();
+                        if (line is null)
+                        {
+                            try { pipe.Dispose(); } catch { }
+                            break;
+                        }
+                        byte[] data = System.Text.Encoding.UTF8.GetBytes(line + "\r\n");
+                        pipe.Write(data, 0, data.Length);
+                        pipe.Flush();
+                    }
+                }
+                catch { }
+            })
+            { IsBackground = true, Name = "winmux-input-fallback" };
+        }
+
+        inThread.Start();
+
+        byte[] outBuf = new byte[4096];
+        try
+        {
+            while (true)
+            {
+                int read = pipe.Read(outBuf, 0, outBuf.Length);
+                if (read == 0) break;
+                stdOut.Write(outBuf, 0, read);
+                stdOut.Flush();
+            }
+        }
+        catch (IOException) { }
+        catch (ObjectDisposedException) { }
+
+        if (inThread?.IsAlive == true)
+        {
+            inThread.Join(TimeSpan.FromSeconds(2));
         }
     }
-    catch (IOException ex)
+    finally
     {
-        Console.Error.WriteLine($"[DIAG] Output loop IOException: {ex.Message}");
-    }
-    catch (ObjectDisposedException)
-    {
-        Console.Error.WriteLine("[DIAG] Output loop ObjectDisposedException (expected after detach).");
+        restoreConsole?.Invoke();
     }
 
-    Console.Error.WriteLine("[DIAG] Output loop ended. Waiting for input thread...");
-    if (inThread != null && inThread.IsAlive)
-    {
-        inThread.Join(TimeSpan.FromSeconds(2));
-    }
-    Console.Error.WriteLine("[DIAG] Input thread joined (or timed out).");
+    Console.WriteLine("\nDetached from session.");
 }
-finally
+
+static bool IsProcessRunning(int pid)
 {
-    Console.Error.WriteLine("[DIAG] finally block: restoring console...");
-    restoreConsole?.Invoke();
+    try
+    {
+        var proc = Process.GetProcessById(pid);
+        return !proc.HasExited;
+    }
+    catch
+    {
+        return false;
+    }
 }
 
-Console.Error.WriteLine("[DIAG] Program exiting normally.");
-Console.WriteLine("\nDetached from session.");
+static string? FindDaemonExecutable()
+{
+    var baseDir = AppContext.BaseDirectory;
+    var candidates = new[]
+    {
+        Path.Combine(baseDir, "WinMUX.Daemon.exe"),
+        Path.Combine(baseDir, "..", "WinMUX.Daemon", "WinMUX.Daemon.exe"),
+        Path.Combine(baseDir, "..", "..", "WinMUX.Daemon", "bin", "Debug", "net8.0", "WinMUX.Daemon.exe"),
+        Path.Combine(baseDir, "..", "..", "WinMUX.Daemon", "bin", "Release", "net8.0", "WinMUX.Daemon.exe"),
+    };
+
+    foreach (var candidate in candidates)
+    {
+        var fullPath = Path.GetFullPath(candidate);
+        if (File.Exists(fullPath))
+            return fullPath;
+    }
+
+    var pathEx = Path.Combine("WinMUX.Daemon.exe");
+    return File.Exists(pathEx) ? pathEx : null;
+}
+
+public record SessionInfo
+{
+    public string Name { get; init; } = string.Empty;
+    public int ProcessId { get; init; }
+    public string Shell { get; init; } = "cmd.exe";
+    public DateTime CreatedAt { get; init; }
+    public DateTime? LastAttachedAt { get; init; }
+}

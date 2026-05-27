@@ -10,25 +10,7 @@
 
 WinMUX is a **native Windows terminal multiplexer** built on Microsoft's ConPTY API. It gives you persistent terminal sessions that survive client disconnect, window close, and even user logout (as a Windows Service).
 
-If you've ever used tmux on Linux and then been forced onto a locked-down Windows machine with WSL disabled, you know the pain. WinMUX fills that gap.
-
 **Key principle:** Bare Windows. No WSL. No MSYS2. No Cygwin. Just `cmd.exe`, `powershell.exe`, or any shell you want, running persistently via native Windows APIs.
-
----
-
-## What Works Today (MVP)
-
-| Feature | Status |
-|---------|--------|
-| Persistent `cmd.exe` sessions | ✅ |
-| Persistent PowerShell sessions | ✅ |
-| Named-pipe attach / detach / reattach | ✅ |
-| Scrollback replay on reattach | ✅ |
-| Server survives client disconnect/crash | ✅ |
-| Self-contained single-file EXEs | ✅ |
-| Automated test suite | ✅ (6 tests) |
-
-**Limitation:** Raw keyboard input (arrow keys, Ctrl sequences) in a real Windows console window is **not yet supported** in the interactive client. Redirected stdin and line-buffered input work correctly. Full raw input via `ReadConsoleInput` + VT encoding is planned for v0.5.
 
 ---
 
@@ -44,22 +26,48 @@ cd WinMUX
 # Build
 dotnet build
 
-# Terminal 1: Start the server (spawns cmd.exe in a headless ConPTY)
-dotnet run --project src/WinMUX.Server -- default
+# Start daemon and create session
+winmux new main cmd.exe        # Creates session 'main'
+winmux new dev powershell.exe  # Creates session 'dev'
 
-# Terminal 2: Attach client
-dotnet run --project src/WinMUX.CLI -- default
+# List sessions
+winmux ls
 
-# Type commands. Close the terminal window.
-# Server keeps running. Re-attach anytime with the same command.
+# Attach to a session
+winmux attach main
+
+# Detach: Ctrl+B, then D
+
+# Kill a session
+winmux kill dev
 ```
 
 ### Self-contained binaries (no .NET runtime needed)
 ```powershell
-dotnet publish src/WinMUX.Server -c Release -r win-x64 --self-contained -p:PublishSingleFile=true
-dotnet publish src/WinMUX.CLI   -c Release -r win-x64 --self-contained -p:PublishSingleFile=true
+dotnet publish src/WinMUX.Server  -c Release -r win-x64 --self-contained -p:PublishSingleFile=true
+dotnet publish src/WinMUX.CLI    -c Release -r win-x64 --self-contained -p:PublishSingleFile=true
+dotnet publish src/WinMUX.Daemon  -c Release -r win-x64 --self-contained -p:PublishSingleFile=true
 # Outputs in bin/Release/net8.0/win-x64/publish/
 ```
+
+---
+
+## What Works Today
+
+| Feature | v0.1 | v0.2 |
+|---------|------|------|
+| Persistent sessions (single default session) | ✅ | ✅ |
+| Named sessions with session manager | ❌ | ✅ |
+| `ls / new / attach / kill` commands | ❌ | ✅ |
+| Daemon auto-start | ❌ | ✅ |
+| Scrollback replay on reattach | ✅ | ✅ |
+| Named-pipe attach/detach/reattach | ✅ | ✅ |
+| Server survives client disconnect | ✅ | ✅ |
+| Multi-session (process-per-session) | ❌ | ✅ |
+| Automated test suite | ✅ | ✅ |
+| Self-contained single-file EXEs | ✅ | ✅ |
+
+**Limitation:** Raw keyboard input (arrow keys, Ctrl sequences) in a real Windows console window is **not yet supported**. Redirected stdin and line-buffered input work. Full raw input via `ReadConsoleInput` + VT encoding is planned for v0.5.
 
 ---
 
@@ -76,85 +84,128 @@ dotnet publish src/WinMUX.CLI   -c Release -r win-x64 --self-contained -p:Publis
 ### Target Users
 
 - **Enterprise developers** on locked-down Windows (WSL disabled)
-- **DevOps engineers** managing Windows servers via SSH/WinRM who want persistent sessions
+- **DevOps engineers** managing Windows servers via SSH/WinRM
 - **Cross-platform teams** standardizing on tmux workflows
-- **Windows Server automation** — lightweight session management without RDP overhead
+- **Windows Server admins** — lightweight session management without RDP
 
 ---
 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────┐
-│            Client (Terminal)                 │
-│  ─ wt.exe, VS Code, WezTerm, etc.           │
-│  ─ Reads VT from named pipe                  │
-│  ─ Writes keystrokes / resize events back    │
-└──────────────────┬──────────────────────────┘
-                   │  IPC (named pipe)
-┌──────────────────▼──────────────────────────┐
-│           Session Server (daemon)            │
-│  ─ Maintains ConPTY handles                  │
-│  ─ Hosts Window → Pane → PTY tree            │
-│  ─ Serializes scrollback per pane            │
-│  ─ Rewrites VT for active client dimensions  │
-└─────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────┐
+│                    WinMUX.Daemon                             │
+│  Control Pipe: WinMUX-control                               │
+│  State: %LOCALAPPDATA%\WinMUX\sessions.json                  │
+│                                                              │
+│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐          │
+│  │ Spawns      │  │ Tracks PIDs │  │ Answers ls  │          │
+│  │ Servers     │  │ & Metadata  │  │ / kill cmds │          │
+│  └──────┬──────┘  └─────────────┘  └─────────────┘          │
+└─────────┼────────────────────────────────────────────────────┘
+          │ spawns
+    ┌─────┴─────┐    ┌─────────────┐    ┌─────────────┐
+    │ Server:   │    │ Server:     │    │ Server:     │
+    │ "main"    │    │ "build"     │    │ "logs"      │
+    │ └── Pipe  │    │ └── Pipe    │    │ └── Pipe    │
+    │   WinMUX- │    │   WinMUX-   │    │   WinMUX-   │
+    │   main    │    │   build     │    │   logs      │
+    └───────────┘    └─────────────┘    └─────────────┘
+          ▲
+          └────────────┐
+    ┌──────────────────┴─────────────────┐
+    │         WinMUX.CLI                  │
+    │  winmux ls          → control pipe  │
+    │  winmux new bash    → daemon spawns │
+    │  winmux attach main → direct pipe     │
+    │  winmux kill build  → daemon kills  │
+    └─────────────────────────────────────┘
 ```
 
-### Stack
-- **C# / .NET 8** — rapid iteration, excellent WinAPI interop
-- **ConPTY** (Windows 10 1809+) — native pseudo-console API
-- **Named pipes** — `System.IO.Pipes`, user-only ACLs by default
-- **Self-contained publish** — single x64 `.exe`, no runtime dependency
-
----
-
-## Comparison
-
-| Tool | Persistent? | Native Windows? | No Admin? | Splits? | OSS? |
-|------|-------------|-----------------|-----------|---------|------|
-| tmux (WSL) | ✅ | ❌ (WSL only) | ✅ | ✅ | ✅ |
-| Windows Terminal | ❌ | ✅ | ✅ | ✅ | ✅ |
-| PowerShell PSSession | Partial | ✅ | ❌ (needs Admin/WinRM) | ❌ | ✅ |
-| MSYS2 tmux | ✅ | Partial (layer) | ✅ | ✅ | ✅ |
-| **WinMUX** | ✅ | ✅ | **Yes** | v0.5 | ✅ |
+**Process-per-session model:** Each session is an isolated Server process. The Daemon only tracks metadata and spawns/kills. Crash isolation between sessions.
 
 ---
 
 ## Roadmap
 
-### v0.5
-- [ ] Raw VT input in real console (`ReadConsoleInput` + manual VT encoding)
-- [ ] Named sessions (`winmux ls`, `winmux new`, `winmux kill`)
-- [ ] Multi-pane splits (horizontal / vertical)
-- [ ] Status bar rendered as VT overlay
-- [ ] Scrollback ring buffer (replace `MemoryStream`)
+### v0.2 ✅ (Current)
+- [x] Session manager (`winmux ls/new/attach/kill`)
+- [x] Process-per-session architecture
+- [x] Daemon with JSON state persistence
+- [x] Auto-start daemon on first command
+
+### v0.3 (Config & Polish)
+- [ ] `config.toml` for default shell, scrollback size
+- [ ] Named pipe security (restrict to current user)
+- [ ] Better error messages
+- [ ] Session attach counts (multiple clients view same session?)
+
+### v0.4 (Ring Buffer)
+- [ ] Circular scrollback buffer (replace MemoryStream)
+- [ ] Scrollback search
+- [ ] Configurable buffer size
+
+### v0.5 (Raw Input)
+- [ ] `ReadConsoleInput` P/Invoke
+- [ ] VT encoding table for key events
+- [ ] Full arrow key / function key support
+- [ ] Multi-pane splits begin here
+
+### v0.6 (Windowing)
+- [ ] Panes, splits, pane navigation
+- [ ] Status bar as VT overlay
+
+### v0.7 (Integration)
+- [ ] Windows Terminal profile JSON
+- [ ] PowerShell module
+- [ ] Keybindings customization
+
+### v0.8 (Beta Release)
+- [ ] MSI installer
+- [ ] winget package
+- [ ] Full documentation
 
 ### v1.0
-- [ ] Windows Service mode (survive user logout)
-- [ ] Config file (`%APPDATA%\winmux\config.toml`)
+- [ ] Windows Service mode (survive logout)
 - [ ] Session restore on boot
-- [ ] Mouse support (pane selection, resizing)
-- [ ] Windows Terminal integration profile
-
-### v2.0
-- [ ] Native GUI client with GPU rendering
-- [ ] Remote attach over TCP/TLS
-- [ ] Serializable session state (survive reboot)
+- [ ] Mouse support
 
 ---
 
-## Contributing
+## Commands
 
-Built by [@AR-Davis](https://github.com/AR-Davis) with help from the Pi coding agent harness.
+```bash
+# Session management
+winmux ls                           # List active sessions
+winmux new <name> [shell]           # Create named session (default: cmd.exe)
+winmux attach <name>                # Attach to session
+winmux kill <name>                  # Terminate session
 
-Pull requests welcome. Focus areas:
-- `ReadConsoleInput` implementation for raw VT input
-- Circular scrollback buffer
-- Multi-session architecture (process-per-session model)
-- Windows Terminal JSON profile integration
+# Daemon control
+winmux daemon                       # Show daemon status
+winmux daemon start                 # Start background daemon
+winmux daemon stop                  # Stop running daemon
 
-See `GORDON_REVIEW_2.md` for detailed technical analysis and architecture recommendations.
+# General
+winmux help                         # Show usage
+```
+
+---
+
+## Development
+
+Built by [@AR-Davis](https://github.com/AR-Davis) with the Pi coding agent harness.
+
+### Project Structure
+```
+WinMUX.sln
+├── src/
+│   ├── WinMUX.Core/       # Session, NativeMethods
+│   ├── WinMUX.Server/     # Per-session ConPTY host
+│   ├── WinMUX.Daemon/     # Session manager coordinator
+│   └── WinMUX.CLI/        # User-facing CLI
+└── test/                   # Automated PowerShell tests
+```
 
 ---
 
