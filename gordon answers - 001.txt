@@ -1,0 +1,408 @@
+## WinMUX Code Review
+
+Project Overview WinMUX is a C# / .NET 8 native Windows terminal multiplexer built on
+ConPTY (Windows Pseudo Console). It consists of three projects: a Core layer (Session
++ NativeMethods wrappers), a Server (manages ConPTY and pipes), and a CLI client
+(terminal UI and input/output routing). The architecture enables session persistence:
+a server process hosts the ConPTY session and named pipe, while clients attach/detach
+without terminating the session.
+
+--------
+
+### 1. Critical Correctness Bugs
+
+Handle Leak on SetHandleInformation Failure (Session.cs) In Start(), if the first
+SetHandleInformation(inputWrite, ...) call fails at line 54, inputWrite (and earlier
+_inputRead) are leaked. The exception is thrown immediately, bypassing the cleanup
+that happens in Dispose(). Similar risk after the second CreatePipe at line 59.
+
+Fix: Wrap early pipe/flag operations in try-finally or use SafeHandle wrappers
+immediately:
+
+
+if (!NativeMethods.CreatePipe(out _inputRead, out IntPtr inputWrite, ref sa, 0))
+throw new Win32Exception(Marshal.GetLastWin32Error());
+
+try
+{
+if (!NativeMethods.SetHandleInformation(inputWrite, NativeMethods.
+HANDLE_FLAG_INHERIT, 0))
+throw new Win32Exception(Marshal.GetLastWin32Error());
+// ... continue
+}
+catch
+{
+NativeMethods.CloseHandle(_inputRead);
+NativeMethods.CloseHandle(inputWrite);
+throw;
+}
+
+
+Potential Race in Dispose() The _disposed flag is checked in Start(), Resize(), but
+not atomically with state modifications. A thread calling Resize() after Dispose()
+starts but before _hPC is zeroed could resize a closed pseudo console. Use a lock or
+Volatile.Read.
+
+Fix: Use Interlocked or a ReaderWriterLockSlim:
+
+
+private int _disposed; // 0 = active, 1 = disposed
+
+public void Resize(short width, short height)
+{
+if (Interlocked.CompareExchange(ref _disposed, -1, -1) != 0)
+throw new ObjectDisposedException(nameof(Session));
+// ... or use a lock
+}
+
+
+--------
+
+### 2. ConPTY Integration
+
+Assessment: Correct Pattern Your ConPTY initialization follows Microsoft's documented
+approach:
+
+- CreatePseudoConsole(inputRead, outputWrite) — ConPTY owns these handles
+- InitializeProcThreadAttributeList + UpdateProcThreadAttribute with
+PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE — correct
+- CreateProcess(..., EXTENDED_STARTUPINFO_PRESENT, ...) — correct
+- STARTF_USESTDHANDLES + INVALID_HANDLE_VALUE (-1) for std handles — correct, signals
+ConPTY to use the attribute list instead
+
+One Note: You pass bInheritHandles = false to CreateProcess, which is correct for
+ConPTY (the attribute list handles inheritance). However, verify that
+SECURITY_ATTRIBUTES.bInheritHandle = true on your pipes actually propagates the
+inherit flag correctly. Your SetHandleInformation(..., HANDLE_FLAG_INHERIT, 0) removes
+inheritance from the handles you write to (inputWrite, outputRead), which is the right
+idea—prevent accidental leaks to children.
+
+--------
+
+### 3. Named Pipe Lifetime & Reconnection
+
+Current Issue: One Client at a Time Your server loop creates a new pipe after each
+client disconnects:
+
+
+while (true)
+{
+using var pipe = new NamedPipeServerStream(pipeName, ...);
+await pipe.WaitForConnectionAsync();
+// ... handle client ...
+}
+
+
+This works for single-client sessions but is fragile:
+
+- If a client crashes mid-session, the loop recreates the pipe, but the old pipe
+handle may still be open briefly → potential collision
+- No other clients can connect while one is attached (by design,
+maxNumberOfServerInstances=1)
+
+Recommendation for v0.5: Consider keeping the pipe alive across client reconnections
+by managing it at the outer scope:
+
+
+using var pipe = new NamedPipeServerStream(pipeName, ...,
+maxNumberOfServerInstances: 1);
+
+while (true)
+{
+await pipe.WaitForConnectionAsync();
+// ... handle client ...
+pipe.Disconnect();  // Reuse the same server stream
+}
+
+
+This avoids the create-destroy churn and is closer to how long-lived services
+typically work. You'd still get one-client-at-a-time semantics.
+
+--------
+
+### 4. Input Thread Safety
+
+Critical Deadlock Risk (Program.cs, CLI)   Your CLI does:
+
+
+var rawIn = new FileStream(safeIn, FileAccess.Read, bufferSize: 256, isAsync:
+false);
+inThread = new Thread(() => {
+byte[] buf = new byte[1024];
+while (true) {
+int n = rawIn.Read(buf, 0, buf.Length);  // BLOCKING
+// ... process prefix ...
+client.Write(buf, start, i - start);     // BLOCKING write
+client.Flush();
+}
+})
+{ IsBackground = true };
+
+// Main thread
+while (true)
+{
+int read = client.Read(outBuf, 0, outBuf.Length);  // BLOCKING read
+stdOut.Write(outBuf, 0, read);
+stdOut.Flush();
+}
+
+
+Scenario: If the server's output pump writes a huge blob to the named pipe (e.g.,
+100KB scrollback at connect time), and your CLI's input thread is blocked in
+rawIn.Read(), the main thread's client.Read() call will block on the pipe receive
+buffer filling up. Meanwhile, the server is trying to write to the same pipe but your
+main output thread is blocked. If the pipe buffer is small (default ~4KB), you hit a
+deadlock:
+
+- Server sends 100KB scrollback → pipe fills → server write blocks
+- Client input thread blocked in console read
+- Client main thread blocked in pipe read (pipe is full, can't accept more data)
+- Server cannot flush the pipe (client won't read)
+
+Fix: Use async pipes throughout or separate threads for input/output with non-blocking
+semantics:
+
+
+// Option 1: Use async methods
+int read = await client.ReadAsync(outBuf, 0, outBuf.Length);
+
+// Option 2: Increase pipe buffer or use overlapped I/O with waits
+// Option 3: Use a third thread to route input, avoiding the blocking main-thread
+read
+
+
+For your MVP, the lowest-risk fix is to use async all the way:
+
+
+var outTask = Task.Run(async () =>
+{
+byte[] outBuf = new byte[4096];
+try
+{
+while (true)
+{
+int read = await client.ReadAsync(outBuf, 0, outBuf.Length);
+if (read == 0) break;
+stdOut.Write(outBuf, 0, read);
+stdOut.Flush();
+}
+}
+catch { }
+});
+
+await outTask; // wait for output to end (client disconnect)
+
+
+--------
+
+### 5. Memory & Resource Leaks
+
+Scrollback Trimming Logic (Program.cs, Server)
+
+
+if (scrollback.Length > 100 * 1024)
+{
+long keep = 50 * 1024;
+byte[] temp = new byte[keep];
+scrollback.Position = scrollback.Length - keep;
+scrollback.Read(temp, 0, (int)keep);
+scrollback.SetLength(0);
+scrollback.Write(temp, 0, temp.Length);
+}
+
+
+This is inefficient but not a leak: you allocate temp, trim the stream, and temp is
+GC'd. Works for MVP but consider a circular buffer (e.g.,
+System.Collections.Concurrent.ConcurrentQueue<byte[]> with fixed chunks) for
+production.
+
+Session.Dispose() — Correct Order
+
+
+try { _inputStream?.Dispose(); } catch { }
+try { _outputStream?.Dispose(); } catch { }
+if (_hPC != IntPtr.Zero) { NativeMethods.ClosePseudoConsole(_hPC); ... }
+if (_inputRead != IntPtr.Zero) { NativeMethods.CloseHandle(_inputRead); ... }
+if (_outputWrite != IntPtr.Zero) { NativeMethods.CloseHandle(_outputWrite); ... }
+
+
+Good: FileStream dispose closes the underlying SafeHandle, which closes the pipes.
+Then you explicitly close the ConPTY-owned handles. No double-close.
+
+Caveat: According to Microsoft docs, ClosePseudoConsole invalidates the I/O handles.
+Closing them after is the safe order. You have this right.
+
+--------
+
+### 6. Scrollback Architecture
+
+Current Issue: Raw Byte Replay Corrupts VT State Your scrollback replays raw ANSI
+escape bytes verbatim:
+
+
+byte[] history = scrollback.ToArray();
+await pipe.WriteAsync(history, 0, history.Length, cts.Token);
+
+
+This works for simple text but breaks for applications that use cursor positioning,
+colors, or state-aware sequences:
+
+- vim — sends cursor-home, region-scroll sequences; replaying them verbatim puts the
+cursor in the wrong position
+- htop — full-screen UI; replay confuses it
+- bash with readline — prompt line calculations get corrupted
+
+Recommendation for v0.5:   Implement a minimal VT state parser to track:
+
+- Cursor position (CUP, HVP sequences)
+- Current foreground/background color
+- Modes (insert/replace, line wrapping)
+
+On reconnect, replay scrollback verbatim for text content, but emit state-reset
+sequences (SGR 0 for colors, cursor-home) before the history. Or maintain a "canonical
+screen buffer" (80x24 grid of styled cells) and dump that on reconnect.
+
+For now, a comment in the code documenting this limitation is fine: // TODO(v0.5):
+Replay via screen buffer instead of raw VT bytes.
+
+--------
+
+### 7. Security Surface
+
+Named Pipe ACLs (Default = Local User Only) By default, Windows restricts
+NamedPipeServerStream to the current user's SID. This is safe for local terminal
+sessions. However:
+
+- If you ever run as a service, explicit ACLs are needed
+- Untrusted input on stdin (keyboard + prefix commands) is parsed synchronously; if a
+malicious VT sequence gets into the session output, it reaches the client. This is
+expected (the server is trusted), but worth noting.
+
+Process Token Inheritance You pass bInheritHandles: false to CreateProcess, preventing
+child processes from accidentally inheriting pipe handles. Correct.
+
+Stdin Forwarding (CLI) — One Risk In your CLI, you read raw bytes from the console and
+forward them to the server without escaping:
+
+
+client.Write(buf, start, i - start);
+
+
+If a user accidentally cats a binary file to stdin, those bytes go directly to the
+ConPTY session. ConPTY will interpret them as input (likely benign), but a malicious
+binary embedded in a script could craft VT sequences. Mitigation: none needed for MVP;
+this is expected behavior.
+
+--------
+
+### 8. Multi-Session Design
+
+Current Constraint: One Session per Server
+
+
+using var session = new Session(shell, 120, 30);
+session.Start();
+
+
+The server is hardcoded to a single session. This is fine for the MVP but limits
+scalability.
+
+Recommendation for v0.5/Production: Support multiple named sessions (e.g.,
+WinMUX.Server session1 session2 session3). Architecture options:
+
+Option A: Thread-per-Session (Simple)
+
+
+foreach (string sessionName in sessionNames)
+{
+_ = Task.Run(() => RunSessionServer(sessionName));
+}
+await Task.Delay(Timeout.Infinite);
+
+async Task RunSessionServer(string sessionName)
+{
+var session = new Session("cmd.exe");
+session.Start();
+// ... existing pipe/client loop ...
+}
+
+
+Pros: Simple, isolated memory/CPU per session. Cons: Threads scale poorly (1000+
+sessions → problems).
+
+Option B: Single Event Loop with Async Pipes (Better)
+
+
+var sessions = new Dictionary<string, Session>();
+var clients = new Dictionary<string, (NamedPipeServerStream,
+CancellationTokenSource)>();
+
+// Single event loop; accept clients for any session
+while (true)
+{
+var tasks = sessions.Keys.Select(name => AcceptClientAsync(name)).ToList();
+await Task.WhenAny(tasks);
+// ... handle whichever session got a client ...
+}
+
+
+Pros: Scales to many sessions, efficient I/O. Cons: More complex state management.
+
+Option C: Separate Processes (Recommended for Isolation) Each WinMUX.Server
+session-name runs as its own process:
+
+
+WinMUX.Server session1   # PID 1234
+WinMUX.Server session2   # PID 1235
+
+
+Pros: Full isolation, crash resilience, easy multi-machine via named pipes on
+\\server\pipe\.... Cons: More processes.
+
+For WinMUX v0.5, Option C is ideal: each session is independent, zero shared state.
+The CLI just picks which session to connect to.
+
+--------
+
+## Summary of Recommendations
+
+Area                 Issue                         Priority   Fix
+
+Handle Leaks         Pipes not closed if           High       Wrap in try-finally
+(Session.Start)      SetHandleInformation fails
+
+Dispose() Race       _disposed check not atomic    Medium     Use Interlocked or
+lock
+
+Deadlock (CLI        Blocking reads on console +   High       Use async pipes,
+Input)               pipe; scrollback write can               separate threads
+fill buffer
+
+Pipe Reconnection    Recreate pipe after each      Low        Use Disconnect() to
+client; risky for rapid                  reuse stream
+reconnects
+
+Scrollback           Raw VT byte replay breaks     Medium     Implement minimal VT
+Corruption           vim, htop, etc.               (v0.5)     state machine or send
+reset sequences
+
+Multi-Session        Single hardcoded session per  Low (MVP   Refactor to Option C
+server                        ok)        (separate processes
+per session)
+
+--------
+
+What you got right:
+
+- ConPTY initialization follows the Microsoft pattern exactly
+- Handle cleanup order (FileStreams before ConPTY close) is correct
+- Pipe security model (inheritance flags, ACLs) is sound
+- Session disposal is robust for the happy path
+
+Most critical to fix before production:
+
+- Handle leaks in Session.Start()
+- Deadlock risk in CLI (convert to async pipes)
+- Scrollback replay corruption (document the limitation and fix in v0.5)
+
+Feel free to ask if you want me to provide patches for any of these.
