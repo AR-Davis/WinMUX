@@ -37,20 +37,17 @@ class Program
     {
         Directory.CreateDirectory(StateDir);
 
-        // Check if another daemon is already running
         if (IsDaemonRunning())
         {
-            Console.WriteLine("Daemon already running. Use 'winmux daemon' to check status.");
+            Console.WriteLine("Daemon already running.");
             Environment.Exit(1);
             return;
         }
 
-        // Write PID lock file
         await File.WriteAllTextAsync(LockFile, Process.GetCurrentProcess().Id.ToString());
 
         try
         {
-            // Load existing state and reconnect to orphaned sessions
             await ReconnectSessions();
 
             Console.WriteLine($"WinMUX Daemon v0.2 (protocol {CurrentDaemonVersion})");
@@ -78,11 +75,7 @@ class Program
                 var proc = Process.GetProcessById(pid);
                 return proc.ProcessName.Contains("WinMUX", StringComparison.OrdinalIgnoreCase);
             }
-            catch (ArgumentException)
-            {
-                // Process doesn't exist, stale lock
-                return false;
-            }
+            catch (ArgumentException) { return false; }
         }
         return false;
     }
@@ -96,25 +89,15 @@ class Program
         }
 
         var json = await File.ReadAllTextAsync(StateFile);
-        var state = JsonSerializer.Deserialize(json, typeof(SessionState), new JsonSerializerOptions
-        {
-            PropertyNameCaseInsensitive = true
-        }) as SessionState ?? new SessionState();
+        var state = JsonSerializer.Deserialize<SessionState>(json) ?? new SessionState();
 
-        // Prune dead sessions - check if processes are still running
         var aliveSessions = new List<SessionInfo>();
         foreach (var session in state.Sessions)
         {
             if (IsProcessRunning(session.ProcessId))
-            {
                 aliveSessions.Add(session);
-                // Track in memory but we don't have the Process object
-                // The session pipe will work directly
-            }
             else
-            {
                 Console.WriteLine($"Session '{session.Name}' (PID {session.ProcessId}) is dead, removing.");
-            }
         }
 
         state.Sessions = aliveSessions;
@@ -128,10 +111,7 @@ class Program
             var proc = Process.GetProcessById(pid);
             return !proc.HasExited;
         }
-        catch
-        {
-            return false;
-        }
+        catch { return false; }
     }
 
     static async Task RunControlLoop()
@@ -140,11 +120,11 @@ class Program
         {
             try
             {
-                await using var pipe = new NamedPipeServerStream(
+                var pipe = new NamedPipeServerStream(
                     ControlPipeName,
                     PipeDirection.InOut,
                     NamedPipeServerStream.MaxAllowedServerInstances,
-                    PipeTransmissionMode.Message,
+                    PipeTransmissionMode.Byte,
                     PipeOptions.Asynchronous);
 
                 await pipe.WaitForConnectionAsync();
@@ -158,19 +138,21 @@ class Program
         }
     }
 
-    static async Task HandleClient(NamedPipeServerStream pipe)
+    static async void HandleClient(NamedPipeServerStream pipe)
     {
+        Console.WriteLine("[DAEMON] HandleClient ENTRY");
         try
         {
             using var reader = new StreamReader(pipe, Encoding.UTF8);
-            using var writer = new StreamWriter(pipe, Encoding.UTF8) { AutoFlush = true };
-
-            var request = await reader.ReadLineAsync();
-            if (string.IsNullOrEmpty(request)) return;
-
-            var parts = request.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+            using var writer = new StreamWriter(pipe, Encoding.UTF8, leaveOpen: false) { AutoFlush = true };
+            
+            var line = await reader.ReadLineAsync();
+            if (string.IsNullOrEmpty(line)) return;
+            
+            var parts = line.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+            if (parts.Length == 0) return;
+            
             var command = parts[0].ToLowerInvariant();
-
             var response = command switch
             {
                 "version" => CurrentDaemonVersion.ToString(),
@@ -179,28 +161,23 @@ class Program
                 "kill" => parts.Length >= 2 ? await KillSession(parts[1]) : "error: usage: kill <name>",
                 "attach-info" => parts.Length >= 2 ? await GetAttachInfo(parts[1]) : "error: usage: attach-info <name>",
                 "prune" => await PruneDeadSessions(),
-                _ => $"error: unknown command '{command}'. Available: version, ls, new, kill, attach-info, prune"
+                _ => $"error: unknown command '{command}'"
             };
-
+            
             await writer.WriteLineAsync(response);
-            pipe.Disconnect();
+            await writer.FlushAsync();
         }
         catch (Exception ex)
         {
-            Console.Error.WriteLine($"[Daemon] Client handler error: {ex.Message}");
+            Console.Error.WriteLine($"[Daemon] Handler error: {ex.Message}");
         }
     }
 
     static SessionState LoadState()
     {
-        if (!File.Exists(StateFile))
-            return new SessionState();
-
+        if (!File.Exists(StateFile)) return new SessionState();
         var json = File.ReadAllText(StateFile);
-        return JsonSerializer.Deserialize(json, typeof(SessionState), new JsonSerializerOptions
-        {
-            PropertyNameCaseInsensitive = true
-        }) as SessionState ?? new SessionState();
+        return JsonSerializer.Deserialize<SessionState>(json) ?? new SessionState();
     }
 
     static void SaveState(SessionState state)
@@ -209,20 +186,6 @@ class Program
         {
             var json = JsonSerializer.Serialize(state, new JsonSerializerOptions { WriteIndented = true });
             File.WriteAllText(StateFile, json);
-        }
-    }
-
-    static void UpdateSession(string name, Func<SessionInfo, SessionInfo> updater)
-    {
-        lock (StateLock)
-        {
-            var state = LoadState();
-            var idx = state.Sessions.FindIndex(s => s.Name.Equals(name, StringComparison.OrdinalIgnoreCase));
-            if (idx >= 0)
-            {
-                state.Sessions[idx] = updater(state.Sessions[idx]);
-                SaveState(state);
-            }
         }
     }
 
@@ -237,10 +200,8 @@ class Program
         if (state.Sessions.Count == 0)
             return Task.FromResult("[]");
 
-        // Validate which are actually still running
         var alive = state.Sessions.Where(s => IsProcessRunning(s.ProcessId)).ToList();
         
-        // Refresh state if we found any dead ones
         if (alive.Count != state.Sessions.Count)
         {
             lock (StateLock)
@@ -263,12 +224,10 @@ class Program
             if (state.Sessions.Any(s => s.Name.Equals(name, StringComparison.OrdinalIgnoreCase)))
                 return Task.FromResult($"error: session '{name}' already exists");
 
-            // Find server executable
             var serverPath = FindServerExecutable();
             if (serverPath == null)
                 return Task.FromResult("error: WinMUX.Server.exe not found");
 
-            // Start server process
             var startInfo = new ProcessStartInfo
             {
                 FileName = serverPath,
@@ -285,7 +244,6 @@ class Program
                 if (proc == null)
                     return Task.FromResult("error: failed to start server process");
 
-                // Wait a moment for the server to start and report its PID
                 Thread.Sleep(500);
 
                 if (proc.HasExited)
@@ -306,7 +264,6 @@ class Program
                 SaveState(state);
                 RunningSessions[name] = proc;
 
-                // Clean up tracking when process exits
                 proc.EnableRaisingEvents = true;
                 proc.Exited += (_, _) =>
                 {
@@ -366,9 +323,6 @@ class Program
         if (!IsProcessRunning(session.ProcessId))
             return Task.FromResult("error: session process is not running");
 
-        // Update last attached time
-        UpdateSession(name, s => s with { LastAttachedAt = DateTime.UtcNow });
-
         var pipeName = $"WinMUX-{name}";
         return Task.FromResult($"ok: {pipeName}");
     }
@@ -382,7 +336,6 @@ class Program
 
     static string? FindServerExecutable()
     {
-        // Try directory of this executable first
         var baseDir = AppContext.BaseDirectory;
         var candidates = new[]
         {
@@ -399,7 +352,6 @@ class Program
                 return fullPath;
         }
 
-        // Try PATH
         var pathEx = Path.Combine("WinMUX.Server.exe");
         return File.Exists(pathEx) ? pathEx : null;
     }

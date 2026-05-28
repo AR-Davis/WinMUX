@@ -99,11 +99,14 @@ static async Task EnsureDaemonRunning()
     Console.WriteLine("Starting WinMUX daemon...");
     StartDaemon();
 
-    for (int i = 0; i < 20; i++)
+    // Wait for daemon to initialize pipe
+    await Task.Delay(1000);
+
+    for (int i = 0; i < 30; i++)
     {
-        await Task.Delay(500);
         if (await IsDaemonRunning())
             return;
+        await Task.Delay(500);
     }
 
     Console.Error.WriteLine("Failed to start daemon");
@@ -115,12 +118,12 @@ static async Task<bool> IsDaemonRunning()
     try
     {
         using var client = new NamedPipeClientStream(".", "WinMUX-control", PipeDirection.InOut, PipeOptions.Asynchronous);
-        await client.ConnectAsync(500);
+        await client.ConnectAsync(2000);
         using var writer = new StreamWriter(client) { AutoFlush = true };
         using var reader = new StreamReader(client);
         await writer.WriteLineAsync("version");
         var response = await reader.ReadLineAsync();
-        return response?.Length > 0 == true;
+        return !string.IsNullOrEmpty(response);
     }
     catch
     {
@@ -574,10 +577,13 @@ static string? FindDaemonExecutable()
     var baseDir = AppContext.BaseDirectory;
     var candidates = new[]
     {
+        // Same directory (published)
         Path.Combine(baseDir, "WinMUX.Daemon.exe"),
-        Path.Combine(baseDir, "..", "WinMUX.Daemon", "WinMUX.Daemon.exe"),
-        Path.Combine(baseDir, "..", "..", "WinMUX.Daemon", "bin", "Debug", "net8.0", "WinMUX.Daemon.exe"),
-        Path.Combine(baseDir, "..", "..", "WinMUX.Daemon", "bin", "Release", "net8.0", "WinMUX.Daemon.exe"),
+        // CLI is in win-x64 subfolder:
+        // From win-x64: ../ = net8.0, ../../ = Debug, ../../../ = bin, ../../../../ = WinMUX.CLI, ../../../../../ = src
+        Path.Combine(baseDir, "..", "..", "..", "..", "..", "WinMUX.Daemon", "WinMUX.Daemon.exe"),
+        Path.Combine(baseDir, "..", "..", "..", "..", "..", "WinMUX.Daemon", "bin", "Debug", "net8.0", "WinMUX.Daemon.exe"),
+        Path.Combine(baseDir, "..", "..", "..", "..", "..", "WinMUX.Daemon", "bin", "Release", "net8.0", "WinMUX.Daemon.exe"),
     };
 
     foreach (var candidate in candidates)
@@ -585,6 +591,24 @@ static string? FindDaemonExecutable()
         var fullPath = Path.GetFullPath(candidate);
         if (File.Exists(fullPath))
             return fullPath;
+    }
+
+    // Try searching up directory tree
+    var searchDir = baseDir;
+    for (int i = 0; i < 8; i++)
+    {
+        try
+        {
+            var found = Directory.GetFiles(searchDir, "WinMUX.Daemon.exe", SearchOption.AllDirectories)
+                .FirstOrDefault();
+            if (found != null)
+                return Path.GetFullPath(found);
+        }
+        catch (UnauthorizedAccessException) { /* continue */ }
+        
+        var nextDir = Path.GetDirectoryName(searchDir);
+        if (string.IsNullOrEmpty(nextDir) || nextDir == searchDir) break;
+        searchDir = nextDir;
     }
 
     var pathEx = Path.Combine("WinMUX.Daemon.exe");
