@@ -6,6 +6,50 @@
 
 ---
 
+## How to Use WinMUX (Right Now)
+
+**The Problem:** You start a 2-hour build in PowerShell, close your laptop to go home, and the build dies because Windows closed your terminal window.
+
+**The Solution:**
+
+```powershell
+# 1. Build once (or download release)
+cd publish
+
+# 2. Create a named session
+.\WinMUX.CLI.exe new build pwsh.exe
+
+# 3. You're now attached. Start your long-running thing
+> npm run build:prod    # or ng build, cargo build, whatever
+
+# 4. Detach (keep the build running)
+# Press Ctrl+B, then D
+# "Detached from session."
+
+# 5. Close your laptop. Go home. Reopen.
+
+# 6. Reattach from anywhere
+.\WinMUX.CLI.exe attach build
+
+# 7. Your build finished (or is still running). Check the output.
+```
+
+**Multiple Projects:**
+```powershell
+.\WinMUX.CLI.exe new frontend cmd.exe    # React app
+.\WinMUX.CLI.exe new backend pwsh.exe     # API server  
+.\WinMUX.CLI.exe new logs cmd.exe        # Log tail session
+
+.\WinMUX.CLI.exe ls                      # See all sessions
+.\WinMUX.CLI.exe attach frontend          # Switch to frontend
+# Ctrl+B D                                # Detach
+.\WinMUX.CLI.exe attach backend          # Switch to backend
+```
+
+**That's it.** Three commands: `new`, `attach`, `ls`.
+
+---
+
 ## What It Is
 
 WinMUX is a **native Windows session manager** that keeps terminal processes running after you disconnect. Built on Microsoft's ConPTY API, it fills the gap between "Windows Terminal tabs close when the window closes" and "tmux via WSL isn't allowed on this machine."
