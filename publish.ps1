@@ -63,9 +63,19 @@ Write-Host "=== Publish Complete ===" -ForegroundColor Cyan
 Write-Host "Location: $PublishDir"
 Write-Host ""
 
+# Copy wrapper script
+$WrapperSource = Join-Path $PSScriptRoot "src\WinMUX.CLI\winmux.bat"
+if (Test-Path $WrapperSource) {
+    Copy-Item -Path $WrapperSource -Destination $PublishDir -Force
+    Write-Host "Copied winmux.bat wrapper" -ForegroundColor Green
+}
+
 $Exes = Get-ChildItem -Path $PublishDir -Filter "WinMUX.*.exe" | Select-Object -ExpandProperty Name
 Write-Host "Executables:" -ForegroundColor Green
 $Exes | ForEach-Object { Write-Host "  $_" }
+if (Test-Path (Join-Path $PublishDir "winmux.bat")) {
+    Write-Host "  winmux.bat (wrapper)" -ForegroundColor Green
+}
 
 Write-Host ""
-Write-Host "Run: cd publish; .\WinMUX.CLI.exe daemon start" -ForegroundColor Yellow
+Write-Host "Run: cd publish; winmux new mysession cmd.exe" -ForegroundColor Yellow

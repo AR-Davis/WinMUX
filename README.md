@@ -13,11 +13,13 @@
 **The Solution:**
 
 ```powershell
-# 1. Build once (or download release)
-cd publish
+# 1. Add to your PATH (one-time setup)
+# Copy ./publish folder to C:\Tools\WinMUX
+# Add C:\Tools\WinMUX to your PATH environment variable
+# Or just: $env:PATH += ";C:\Users\you\Projects\WinMUX\publish"
 
 # 2. Create a named session
-.\WinMUX.CLI.exe new build pwsh.exe
+winmux new build pwsh.exe
 
 # 3. You're now attached. Start your long-running thing
 > npm run build:prod    # or ng build, cargo build, whatever
@@ -29,24 +31,24 @@ cd publish
 # 5. Close your laptop. Go home. Reopen.
 
 # 6. Reattach from anywhere
-.\WinMUX.CLI.exe attach build
+winmux attach build
 
 # 7. Your build finished (or is still running). Check the output.
 ```
 
 **Multiple Projects:**
 ```powershell
-.\WinMUX.CLI.exe new frontend cmd.exe    # React app
-.\WinMUX.CLI.exe new backend pwsh.exe     # API server  
-.\WinMUX.CLI.exe new logs cmd.exe        # Log tail session
+winmux new frontend cmd.exe    # React app
+winmux new backend pwsh.exe     # API server  
+winmux new logs cmd.exe        # Log tail session
 
-.\WinMUX.CLI.exe ls                      # See all sessions
-.\WinMUX.CLI.exe attach frontend          # Switch to frontend
-# Ctrl+B D                                # Detach
-.\WinMUX.CLI.exe attach backend          # Switch to backend
+winmux ls                      # See all sessions
+winmux attach frontend          # Switch to frontend
+# Ctrl+B D                      # Detach
+winmux attach backend          # Switch to backend
 ```
 
-**That's it.** Three commands: `new`, `attach`, `ls`.
+**That's it.** Three commands: `winmux new`, `winmux attach`, `winmux ls`.
 
 ---
 
@@ -67,25 +69,30 @@ WinMUX is a **native Windows session manager** that keeps terminal processes run
 git clone https://github.com/AR-Davis/WinMUX.git
 cd WinMUX
 
-# Build self-contained executables (no .NET runtime needed on target machine)
+# Build self-contained executables
 .\publish.ps1
 
-# Run
-cd publish
-.\WinMUX.CLI.exe new build cmd.exe    # Create session named 'build'
-.\WinMUX.CLI.exe attach build           # Attach to it
+# Add to PATH (optional but recommended)
+$env:PATH += ";$PWD\publish"
+# Or copy ./publish to C:\Tools\WinMUX and add that to your PATH
+
+# Use it
+winmux new build cmd.exe       # Create session named 'build'
+winmux attach build            # Attach to it
 # Ctrl+B, then D to detach
 
 # Manage
-.\WinMUX.CLI.exe ls                     # List sessions
-.\WinMUX.CLI.exe kill build             # Terminate session
-.\WinMUX.CLI.exe daemon stop            # Stop background daemon
+winmux ls                      # List sessions
+winmux kill build              # Terminate session
+winmux daemon stop             # Stop background daemon
 ```
 
 **Outputs:** Three executables in `./publish/` (60MB each, self-contained):
-- `WinMUX.CLI.exe` — User interface
+- `WinMUX.CLI.exe` — User interface (called via `winmux` wrapper)
 - `WinMUX.Daemon.exe` — Session coordinator
 - `WinMUX.Server.exe` — Per-session host
+
+The `publish` folder also includes a `winmux.bat` wrapper so you can call `winmux` instead of `WinMUX.CLI.exe`.
 
 ---
 
