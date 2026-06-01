@@ -23,40 +23,40 @@ Requires: **Windows 10 1809+** and [.NET 8 SDK](https://dotnet.microsoft.com/dow
 git clone https://github.com/AR-Davis/WinMUX.git
 cd WinMUX
 
-# Build
-dotnet build
+# Build (self-contained, single-folder)
+.\publish.ps1
+
+# All executables in ./publish/
+cd publish
 
 # Start daemon and create session
-winmux new main cmd.exe        # Creates session 'main'
-winmux new dev powershell.exe  # Creates session 'dev'
+.\WinMUX.CLI.exe new main cmd.exe        # Creates session 'main'
+.\WinMUX.CLI.exe new dev powershell.exe  # Creates session 'dev'
 
 # List sessions
-winmux ls
+.\WinMUX.CLI.exe ls
 
 # Attach to a session
-winmux attach main
+.\WinMUX.CLI.exe attach main
 
 # Detach: Ctrl+B, then D
 
 # Kill a session
-winmux kill dev
+.\WinMUX.CLI.exe kill dev
 ```
 
 ### Self-contained binaries (no .NET runtime needed)
 ```powershell
-dotnet publish src/WinMUX.Server  -c Release -r win-x64 --self-contained -p:PublishSingleFile=true
-dotnet publish src/WinMUX.CLI    -c Release -r win-x64 --self-contained -p:PublishSingleFile=true
-dotnet publish src/WinMUX.Daemon  -c Release -r win-x64 --self-contained -p:PublishSingleFile=true
-# Outputs in bin/Release/net8.0/win-x64/publish/
+.\publish.ps1  # Builds all components to ./publish/
 ```
 
 ---
 
 ## What Works Today
 
-| Feature | v0.1 | v0.2 |
-|---------|------|------|
-| Persistent sessions (single default session) | ✅ | ✅ |
+| Feature | v0.1 | v0.2 🚢 |
+|---------|------|---------|
+| Persistent sessions (single default) | ✅ | ✅ |
 | Named sessions with session manager | ❌ | ✅ |
 | `ls / new / attach / kill` commands | ❌ | ✅ |
 | Daemon auto-start | ❌ | ✅ |
@@ -66,6 +66,8 @@ dotnet publish src/WinMUX.Daemon  -c Release -r win-x64 --self-contained -p:Publ
 | Multi-session (process-per-session) | ❌ | ✅ |
 | Automated test suite | ✅ | ✅ |
 | Self-contained single-file EXEs | ✅ | ✅ |
+
+**v0.2 Status:** [Shipped 2026-06-01] — Pipe communication fix deployed. Raw I/O protocol replaces StreamReader/StreamWriter deadlock. Self-contained publish folder.
 
 **Limitation:** Raw keyboard input (arrow keys, Ctrl sequences) in a real Windows console window is **not yet supported**. Redirected stdin and line-buffered input work. Full raw input via `ReadConsoleInput` + VT encoding is planned for v0.5.
 
