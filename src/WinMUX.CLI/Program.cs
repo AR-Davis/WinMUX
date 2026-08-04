@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using System.IO.Pipes;
 using System.Runtime.InteropServices;
+using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using System.ComponentModel;
@@ -119,16 +120,39 @@ static async Task<bool> IsDaemonRunning()
     {
         using var client = new NamedPipeClientStream(".", "WinMUX-control", PipeDirection.InOut, PipeOptions.Asynchronous);
         await client.ConnectAsync(2000);
-        using var writer = new StreamWriter(client) { AutoFlush = true };
-        using var reader = new StreamReader(client);
-        await writer.WriteLineAsync("version");
-        var response = await reader.ReadLineAsync();
+        
+        // Send version command using raw bytes
+        var requestBytes = Encoding.UTF8.GetBytes("version\n");
+        await client.WriteAsync(requestBytes, 0, requestBytes.Length);
+        await client.FlushAsync();
+        
+        // Read response byte by byte until newline
+        var response = await ReadLineAsync(client);
         return !string.IsNullOrEmpty(response);
     }
     catch
     {
         return false;
     }
+}
+
+static async Task<string?> ReadLineAsync(NamedPipeClientStream pipe)
+{
+    var buffer = new List<byte>();
+    var temp = new byte[1];
+    
+    while (true)
+    {
+        int read = await pipe.ReadAsync(temp, 0, 1);
+        if (read == 0) break;
+        
+        if (temp[0] == (byte)'\n')
+            break;
+        if (temp[0] != (byte)'\r')
+            buffer.Add(temp[0]);
+    }
+    
+    return buffer.Count > 0 ? Encoding.UTF8.GetString(buffer.ToArray()) : null;
 }
 
 static void StartDaemon()
@@ -232,11 +256,12 @@ static async Task ListSessions()
     {
         using var client = new NamedPipeClientStream(".", "WinMUX-control", PipeDirection.InOut, PipeOptions.Asynchronous);
         await client.ConnectAsync(5000);
-        using var writer = new StreamWriter(client) { AutoFlush = true };
-        using var reader = new StreamReader(client);
-
-        await writer.WriteLineAsync("ls");
-        var response = await reader.ReadLineAsync();
+        
+        var requestBytes = Encoding.UTF8.GetBytes("ls\n");
+        await client.WriteAsync(requestBytes, 0, requestBytes.Length);
+        await client.FlushAsync();
+        
+        var response = await ReadLineAsync(client);
 
         if (response == "[]")
         {
@@ -283,11 +308,15 @@ static async Task CreateSession(string name, string shell)
     {
         using var client = new NamedPipeClientStream(".", "WinMUX-control", PipeDirection.InOut, PipeOptions.Asynchronous);
         await client.ConnectAsync(5000);
-        using var writer = new StreamWriter(client) { AutoFlush = true };
-        using var reader = new StreamReader(client);
-
-        await writer.WriteLineAsync($"new {name} {shell}");
-        var response = await reader.ReadLineAsync();
+        
+        var request = $"new {name} {shell}";
+        Console.Error.WriteLine($"[DIAG] Sending: {request}");
+        var requestBytes = Encoding.UTF8.GetBytes(request + "\n");
+        await client.WriteAsync(requestBytes, 0, requestBytes.Length);
+        await client.FlushAsync();
+        
+        var response = await ReadLineAsync(client);
+        Console.Error.WriteLine($"[DIAG] Response: {response}");
 
         if (response?.StartsWith("ok:") == true)
         {
@@ -318,11 +347,12 @@ static async Task KillSession(string name)
     {
         using var client = new NamedPipeClientStream(".", "WinMUX-control", PipeDirection.InOut, PipeOptions.Asynchronous);
         await client.ConnectAsync(5000);
-        using var writer = new StreamWriter(client) { AutoFlush = true };
-        using var reader = new StreamReader(client);
-
-        await writer.WriteLineAsync($"kill {name}");
-        var response = await reader.ReadLineAsync();
+        
+        var requestBytes = Encoding.UTF8.GetBytes($"kill {name}\n");
+        await client.WriteAsync(requestBytes, 0, requestBytes.Length);
+        await client.FlushAsync();
+        
+        var response = await ReadLineAsync(client);
 
         if (response == "ok")
         {
@@ -348,11 +378,12 @@ static async Task AttachToSession(string name)
     {
         using var client = new NamedPipeClientStream(".", "WinMUX-control", PipeDirection.InOut, PipeOptions.Asynchronous);
         await client.ConnectAsync(5000);
-        using var writer = new StreamWriter(client) { AutoFlush = true };
-        using var reader = new StreamReader(client);
-
-        await writer.WriteLineAsync($"attach-info {name}");
-        var response = await reader.ReadLineAsync();
+        
+        var requestBytes = Encoding.UTF8.GetBytes($"attach-info {name}\n");
+        await client.WriteAsync(requestBytes, 0, requestBytes.Length);
+        await client.FlushAsync();
+        
+        var response = await ReadLineAsync(client);
 
         if (response?.StartsWith("ok:") == true)
         {
@@ -575,25 +606,13 @@ static bool IsProcessRunning(int pid)
 static string? FindDaemonExecutable()
 {
     var baseDir = AppContext.BaseDirectory;
-    var candidates = new[]
-    {
-        // Same directory (published)
-        Path.Combine(baseDir, "WinMUX.Daemon.exe"),
-        // CLI is in win-x64 subfolder:
-        // From win-x64: ../ = net8.0, ../../ = Debug, ../../../ = bin, ../../../../ = WinMUX.CLI, ../../../../../ = src
-        Path.Combine(baseDir, "..", "..", "..", "..", "..", "WinMUX.Daemon", "WinMUX.Daemon.exe"),
-        Path.Combine(baseDir, "..", "..", "..", "..", "..", "WinMUX.Daemon", "bin", "Debug", "net8.0", "WinMUX.Daemon.exe"),
-        Path.Combine(baseDir, "..", "..", "..", "..", "..", "WinMUX.Daemon", "bin", "Release", "net8.0", "WinMUX.Daemon.exe"),
-    };
+    
+    // Self-contained deployment: everything in same folder
+    var sameDir = Path.Combine(baseDir, "WinMUX.Daemon.exe");
+    if (File.Exists(sameDir))
+        return sameDir;
 
-    foreach (var candidate in candidates)
-    {
-        var fullPath = Path.GetFullPath(candidate);
-        if (File.Exists(fullPath))
-            return fullPath;
-    }
-
-    // Try searching up directory tree
+    // Development: search from project root
     var searchDir = baseDir;
     for (int i = 0; i < 8; i++)
     {
@@ -611,8 +630,7 @@ static string? FindDaemonExecutable()
         searchDir = nextDir;
     }
 
-    var pathEx = Path.Combine("WinMUX.Daemon.exe");
-    return File.Exists(pathEx) ? pathEx : null;
+    return null;
 }
 
 public record SessionInfo

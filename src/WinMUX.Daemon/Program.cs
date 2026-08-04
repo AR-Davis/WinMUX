@@ -143,34 +143,63 @@ class Program
         Console.WriteLine("[DAEMON] HandleClient ENTRY");
         try
         {
-            using var reader = new StreamReader(pipe, Encoding.UTF8);
-            using var writer = new StreamWriter(pipe, Encoding.UTF8, leaveOpen: false) { AutoFlush = true };
-            
-            var line = await reader.ReadLineAsync();
-            if (string.IsNullOrEmpty(line)) return;
-            
-            var parts = line.Split(' ', StringSplitOptions.RemoveEmptyEntries);
-            if (parts.Length == 0) return;
-            
-            var command = parts[0].ToLowerInvariant();
-            var response = command switch
+            using (pipe)
             {
-                "version" => CurrentDaemonVersion.ToString(),
-                "ls" => await ListSessions(),
-                "new" => parts.Length >= 2 ? await CreateSession(parts[1], parts.Length >= 3 ? parts[2] : "cmd.exe") : "error: usage: new <name> [shell]",
-                "kill" => parts.Length >= 2 ? await KillSession(parts[1]) : "error: usage: kill <name>",
-                "attach-info" => parts.Length >= 2 ? await GetAttachInfo(parts[1]) : "error: usage: attach-info <name>",
-                "prune" => await PruneDeadSessions(),
-                _ => $"error: unknown command '{command}'"
-            };
-            
-            await writer.WriteLineAsync(response);
-            await writer.FlushAsync();
+                // Read raw bytes until newline - avoid StreamReader buffering
+                var request = await ReadLineAsync(pipe);
+                if (string.IsNullOrEmpty(request)) return;
+                
+                Console.WriteLine($"[DAEMON] Received: {request}");
+                
+                var parts = request.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+                if (parts.Length == 0) return;
+                
+                var command = parts[0].ToLowerInvariant();
+                var response = command switch
+                {
+                    "version" => CurrentDaemonVersion.ToString(),
+                    "ls" => await ListSessions(),
+                    "new" => parts.Length >= 2 ? await CreateSession(parts[1], parts.Length >= 3 ? parts[2] : "cmd.exe") : "error: usage: new <name> [shell]",
+                    "kill" => parts.Length >= 2 ? await KillSession(parts[1]) : "error: usage: kill <name>",
+                    "attach-info" => parts.Length >= 2 ? await GetAttachInfo(parts[1]) : "error: usage: attach-info <name>",
+                    "prune" => await PruneDeadSessions(),
+                    _ => $"error: unknown command '{command}'"
+                };
+                
+                Console.WriteLine($"[DAEMON] Sending: {response}");
+                await WriteLineAsync(pipe, response);
+            }
         }
         catch (Exception ex)
         {
             Console.Error.WriteLine($"[Daemon] Handler error: {ex.Message}");
         }
+    }
+
+    static async Task<string?> ReadLineAsync(NamedPipeServerStream pipe)
+    {
+        var buffer = new List<byte>();
+        var temp = new byte[1];
+        
+        while (true)
+        {
+            int read = await pipe.ReadAsync(temp, 0, 1);
+            if (read == 0) break; // EOF
+            
+            if (temp[0] == (byte)'\n')
+                break;
+            if (temp[0] != (byte)'\r') // Skip CR in CRLF
+                buffer.Add(temp[0]);
+        }
+        
+        return buffer.Count > 0 ? Encoding.UTF8.GetString(buffer.ToArray()) : null;
+    }
+
+    static async Task WriteLineAsync(NamedPipeServerStream pipe, string line)
+    {
+        var bytes = Encoding.UTF8.GetBytes(line + "\n");
+        await pipe.WriteAsync(bytes, 0, bytes.Length);
+        await pipe.FlushAsync();
     }
 
     static SessionState LoadState()
@@ -337,22 +366,30 @@ class Program
     static string? FindServerExecutable()
     {
         var baseDir = AppContext.BaseDirectory;
-        var candidates = new[]
-        {
-            Path.Combine(baseDir, "WinMUX.Server.exe"),
-            Path.Combine(baseDir, "..", "WinMUX.Server", "WinMUX.Server.exe"),
-            Path.Combine(baseDir, "..", "..", "WinMUX.Server", "bin", "Debug", "net8.0", "WinMUX.Server.exe"),
-            Path.Combine(baseDir, "..", "..", "WinMUX.Server", "bin", "Release", "net8.0", "WinMUX.Server.exe"),
-        };
+        
+        // Self-contained deployment: everything in same folder
+        var sameDir = Path.Combine(baseDir, "WinMUX.Server.exe");
+        if (File.Exists(sameDir))
+            return sameDir;
 
-        foreach (var candidate in candidates)
+        // Development: search from project root
+        var searchDir = baseDir;
+        for (int i = 0; i < 8; i++)
         {
-            var fullPath = Path.GetFullPath(candidate);
-            if (File.Exists(fullPath))
-                return fullPath;
+            try
+            {
+                var found = Directory.GetFiles(searchDir, "WinMUX.Server.exe", SearchOption.AllDirectories)
+                    .FirstOrDefault();
+                if (found != null)
+                    return Path.GetFullPath(found);
+            }
+            catch (UnauthorizedAccessException) { /* continue */ }
+            
+            var nextDir = Path.GetDirectoryName(searchDir);
+            if (string.IsNullOrEmpty(nextDir) || nextDir == searchDir) break;
+            searchDir = nextDir;
         }
 
-        var pathEx = Path.Combine("WinMUX.Server.exe");
-        return File.Exists(pathEx) ? pathEx : null;
+        return null;
     }
 }
